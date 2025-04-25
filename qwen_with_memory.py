@@ -35,6 +35,10 @@ class QwenMemoryConfig:
     dim_head: int = 64
     heads: int = 8
     memory_depth: int = 2
+    
+    # Sequence reduction strategy
+    # Options: 'conv_pre_dense', 'conv_post_dense', 'drop_second_half', 'drop_random_half'
+    sequence_reduction_strategy: str = 'conv_pre_dense'
 
 
 class QwenWithIntegratedMemory(nn.Module):
@@ -80,6 +84,10 @@ class QwenWithIntegratedMemory(nn.Module):
         # Setup neural memory modules
         self.setup_neural_memory()
         
+        # For sequence reduction strategies
+        self.reduction_layers = {}  # Store conv layers by module ID
+        self.original_seq_lengths = {}  # Track original sequence lengths by layer
+        
         # Register hooks for memory integration
         self.register_memory_hooks()
         
@@ -109,88 +117,251 @@ class QwenWithIntegratedMemory(nn.Module):
                     )
                 )
     
+    def make_memory_hook(self, idx):
+        """Create a hook that integrates neural memory."""
+        def hook(module, inputs):
+            hidden_states = inputs[0]
+            
+            # Store hidden state for the QKV layer selector
+            self.mem_input_layers.append(hidden_states)
+            
+            # Apply neural memory
+            if len(self.mem_input_layers) > 1:
+                # Create QKV input from different layers for better memory performance
+                q_input = hidden_states
+                k_input = v_input = self.mem_input_layers[-2]  # Use previous layer
+                qkv_input = torch.stack([q_input, k_input, v_input], dim=0)
+            else:
+                # If not enough layers stored yet, use current hidden states for all
+                qkv_input = torch.stack([hidden_states, hidden_states, hidden_states], dim=0)
+            
+            # Get neural memory for this layer
+            neural_memory = self.neural_memories[str(idx)]
+            
+            # Get current memory state
+            state = self.memory_states.get(idx, None)
+            
+            # Apply neural memory - Never pass prev_weights
+            retrieved, next_state = neural_memory(
+                qkv_input,
+                state=state,
+                prev_weights=None  # Always None
+            )
+            
+            # Store updated state
+            self.memory_states[idx] = next_state
+            
+            # Store the original sequence length for reduction operations
+            self.original_seq_lengths[idx] = hidden_states.shape[1]
+            
+            # Concatenate retrieved memory with hidden states
+            modified_hidden_states = torch.cat([hidden_states, retrieved], dim=1)
+            
+            # Return modified inputs to the module
+            return (modified_hidden_states,) + inputs[1:]
+        
+        return hook
+    
+    def make_conv_reduction_hook(self, pre_dense=False):
+        """
+        Create a hook that applies 1D convolution to reduce sequence length.
+        
+        Args:
+            pre_dense (bool): If True, applies before dense layer; if False, after dense layer
+        """
+        def hook(module, inputs, outputs):
+            # For pre_dense, we intercept after the attention operation
+            if pre_dense:
+                # In Qwen2, we need to access the attention output
+                attn_output = outputs[0] if isinstance(outputs, tuple) else outputs
+                
+                # Dynamically create conv layer if it doesn't exist
+                layer_id = id(module)
+                if layer_id not in self.reduction_layers:
+                    in_dim = attn_output.shape[-1]
+                    self.reduction_layers[layer_id] = nn.Conv1d(
+                        in_channels=in_dim,
+                        out_channels=in_dim,
+                        kernel_size=2,
+                        stride=2,
+                        padding=0
+                    ).to(attn_output.device)
+                
+                # Apply convolution to reduce sequence length
+                # Shape: [batch, seq_len, dim] -> [batch, dim, seq_len] -> conv -> [batch, dim, seq_len//2]
+                # -> [batch, seq_len//2, dim]
+                conv = self.reduction_layers[layer_id]
+                x = attn_output.transpose(1, 2)
+                x = conv(x)
+                x = x.transpose(1, 2)
+                
+                # Replace in outputs
+                if isinstance(outputs, tuple):
+                    return (x,) + outputs[1:]
+                return x
+            
+            # For post_dense (after the entire attention module)
+            else:
+                # Get the hidden state output
+                hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+                
+                # Dynamically create conv layer if it doesn't exist
+                layer_id = id(module)
+                if layer_id not in self.reduction_layers:
+                    in_dim = hidden_states.shape[-1]
+                    self.reduction_layers[layer_id] = nn.Conv1d(
+                        in_channels=in_dim,
+                        out_channels=in_dim,
+                        kernel_size=2,
+                        stride=2,
+                        padding=0
+                    ).to(hidden_states.device)
+                
+                # Apply convolution to reduce sequence length
+                conv = self.reduction_layers[layer_id]
+                x = hidden_states.transpose(1, 2)
+                x = conv(x)
+                x = x.transpose(1, 2)
+                
+                # Replace in outputs
+                if isinstance(outputs, tuple):
+                    return (x,) + outputs[1:]
+                return x
+        
+        return hook
+    
+    def make_drop_half_hook(self, random=False):
+        """
+        Create a hook that drops half of the tokens to reduce sequence length.
+        
+        Args:
+            random (bool): If True, drops random tokens; if False, drops second half
+        """
+        def hook(module, inputs, outputs):
+            # Access the hidden states
+            hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+            
+            # Find the original length (stored when we added the retrieved tokens)
+            layer_idx = next((i for i, layer in enumerate(self.qwen_model.model.layers) 
+                             if id(layer) == id(module)), None)
+            original_len = self.original_seq_lengths.get(layer_idx, hidden_states.shape[1] // 2)
+            
+            # Drop the second half of tokens
+            x = hidden_states[:, :original_len]
+            
+            # Replace in outputs
+            if isinstance(outputs, tuple):
+                return (x,) + outputs[1:]
+            return x
+        
+        return hook
+    
+    def make_drop_random_half_hook(self):
+        """Create a hook that randomly drops half of the tokens."""
+        def hook(module, inputs, outputs):
+            # Access the hidden states
+            hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+            batch_size, seq_len, dim = hidden_states.shape
+            
+            # Find the original length (stored when we added the retrieved tokens)
+            layer_idx = next((i for i, layer in enumerate(self.qwen_model.model.layers) 
+                             if id(layer) == id(module)), None)
+            original_len = self.original_seq_lengths.get(layer_idx, seq_len // 2)
+            keep_len = original_len  # Keep tokens equal to original length
+            
+            # Create random indices for token selection (different for each item in batch)
+            indices = []
+            for i in range(batch_size):
+                # Create random permutation of indices
+                perm = torch.randperm(seq_len, device=hidden_states.device)
+                # Select the first keep_len indices
+                indices.append(perm[:keep_len])
+            
+            # Stack batch indices
+            batch_indices = torch.stack(indices)
+            
+            # Select tokens batch-wise
+            selected_tokens = []
+            for i in range(batch_size):
+                selected_tokens.append(hidden_states[i, batch_indices[i]])
+            
+            # Stack back into tensor [batch, keep_len, dim]
+            x = torch.stack(selected_tokens)
+            
+            # Replace in outputs
+            if isinstance(outputs, tuple):
+                return (x,) + outputs[1:]
+            return x
+        
+        return hook
+    
     def register_memory_hooks(self):
-        """Register forward hooks on target decoder layers."""
+        """Register forward hooks on target decoder layers and sequence reduction hooks."""
         for layer_idx in self.memory_config.neural_memory_layers:
             if layer_idx < len(self.qwen_model.model.layers):
                 layer = self.qwen_model.model.layers[layer_idx]
                 
-                # Using a closure to capture layer_idx
-                def make_forward_hook(idx):
-                    def hook(module, inputs):
-                        hidden_states = inputs[0]
-                        
-                        # Store hidden state for the QKV layer selector
-                        self.mem_input_layers.append(hidden_states)
-                        
-                        # Apply neural memory
-                        if len(self.mem_input_layers) > 1:
-                            # Create QKV input from different layers for better memory performance
-                            q_input = hidden_states
-                            k_input = v_input = self.mem_input_layers[-2]  # Use previous layer
-                            qkv_input = torch.stack([q_input, k_input, v_input], dim=0)
-                        else:
-                            # If not enough layers stored yet, use current hidden states for all
-                            qkv_input = torch.stack([hidden_states, hidden_states, hidden_states], dim=0)
-                        
-                        # Get neural memory for this layer
-                        neural_memory = self.neural_memories[str(idx)]
-                        
-                        # Get current memory state
-                        state = self.memory_states.get(idx, None)
-                        
-                        # Apply neural memory - Never pass prev_weights
-                        retrieved, next_state = neural_memory(
-                            qkv_input,
-                            state=state,
-                            prev_weights=None  # Always None
-                        )
-                        
-                        # Store updated state
-                        self.memory_states[idx] = next_state
-                        
-                        # Apply retrieved memory as residual
-                        modified_hidden_states = hidden_states + retrieved
-                        
-                        # Return modified inputs to the module
-                        return (modified_hidden_states,) + inputs[1:]
-                    
-                    return hook
+                # Register the memory hook
+                layer.register_forward_pre_hook(self.make_memory_hook(layer_idx))
                 
-                # Register the hook
-                layer.register_forward_pre_hook(make_forward_hook(layer_idx))
+                # Now register the appropriate reduction hook based on the strategy
+                strategy = self.memory_config.sequence_reduction_strategy
+                
+                if strategy == 'conv_pre_dense':
+                    # Register hook after attention but before dense layer
+                    layer.self_attn.register_forward_hook(self.make_conv_reduction_hook(pre_dense=True))
+                elif strategy == 'conv_post_dense':
+                    # Register hook after dense layer
+                    layer.register_forward_hook(self.make_conv_reduction_hook(pre_dense=False))
+                elif strategy == 'drop_second_half':
+                    # Register hook to drop second half of tokens
+                    layer.register_forward_hook(self.make_drop_half_hook(random=False))
+                elif strategy == 'drop_random_half':
+                    # Register hook to randomly drop half of tokens
+                    layer.register_forward_hook(self.make_drop_random_half_hook())
     
-    def reset_memory_state(self):
-        """Reset all memory-related state variables."""
-        self.memory_states = {}  # Stores NeuralMemoryState for each layer
-        self.mem_input_layers = []  # Stores hidden states for QKV selection
+    def reset_memory_state(self, reset=None):
+        """
+        Reset memory state.
+        
+        Args:
+            reset: Optional boolean whether to reset state between forward calls or not.
+                If None or True, resets all states.
+                If False, does nothing.
+        """
+        # Complete reset of all states
+        if reset is None or reset is True:
+            self.memory_states = {}
+            self.mem_input_layers = []
+            return
+        
+        # Don't reset anything
+        if reset is False:
+            return
+        
         
     def seq_len_with_longterm_mem(self, seq_len):
         """Calculate sequence length after adding memory tokens."""
-        return ((seq_len - 1) // self.memory_config.segment_len) * self.memory_config.num_longterm_mem_tokens + seq_len
-        
+        # Simply add the number of memory tokens to the sequence length
+        return seq_len + self.memory_config.num_longterm_mem_tokens
+   
     def prepare_memory_inputs(self, hidden_states):
         """
         Prepare inputs by adding memory tokens and applying positional embeddings.
-        This is called at the beginning of the forward pass.
+        This function prepends persistent memory tokens to the beginning of each sequence,
+        rather than interspersing them between segments.
         """
         batch, seq_len = hidden_states.shape[:2]
         
-        # Segment the input sequence
-        hidden_states, inverse_segment = pad_and_segment_with_inverse(
-            hidden_states, 
-            self.memory_config.segment_len, 
-            inverse_remove_pad=False
-        )
-        
-        # Add long-term memory tokens
+        # Create memory tokens for each batch
         mems = repeat(self.longterm_mems, 'n d -> b n d', b=batch)
-        hidden_states, inverse_pack_mems = pack([hidden_states, mems], 'b * d')
-        hidden_states = inverse_segment(hidden_states)
         
-        # Calculate sequence length with memory
-        seq_len_with_mem = self.seq_len_with_longterm_mem(seq_len)
-        hidden_states = hidden_states[:, :seq_len_with_mem]
+        # Simply concatenate memory tokens at the beginning of each sequence
+        # This is a simpler approach than interspersing tokens between segments
+        hidden_states = torch.cat([mems, hidden_states], dim=1)
+        
+        # Calculate total sequence length
+        seq_len_with_mem = seq_len + self.memory_config.num_longterm_mem_tokens
         
         # Apply axial positional embeddings
         pos_emb = self.axial_pos_emb.forward_with_seq_len(
@@ -200,11 +371,6 @@ class QwenWithIntegratedMemory(nn.Module):
         hidden_states = hidden_states + pos_emb
         
         return hidden_states
-        
-    def extract_original_sequence(self, hidden_states, original_seq_len):
-        """Extract the original sequence from the sequence with memory tokens."""
-        # This is a simplified approach - may need adjustment depending on exact memory token placement
-        return hidden_states[:, :original_seq_len]
     
     def forward(
         self,
@@ -218,13 +384,15 @@ class QwenWithIntegratedMemory(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        reset_memory: Optional[bool] = None,
         **kwargs
     ):
         """
         Modified forward pass to incorporate memory mechanisms.
         """
         # Reset memory state at the beginning of each forward pass
-        self.reset_memory_state()
+        self.reset_memory_state(reset_memory)
+        self.original_seq_lengths = {}
         
         # Get input embeddings if not provided
         if inputs_embeds is None and input_ids is not None:
@@ -233,7 +401,7 @@ class QwenWithIntegratedMemory(nn.Module):
         # Store original sequence length for later extraction
         original_seq_len = inputs_embeds.shape[1]
         
-        # Apply memory transformations to input embeddings
+        # Add persistent memory tokens at the beginning of the sequence
         inputs_embeds = self.prepare_memory_inputs(inputs_embeds)
         
         # Forward through the model with modified inputs
@@ -251,12 +419,31 @@ class QwenWithIntegratedMemory(nn.Module):
             **kwargs
         )
         
+        # IMPORTANT: We need to remove the memory tokens from the output
+        # Since we prepended memory tokens, we need to remove the first num_longterm_mem_tokens
+        # positions from the output logits
+        if return_dict:
+            # For CausalLMOutputWithPast, modify the logits
+            num_mem_tokens = self.memory_config.num_longterm_mem_tokens
+            outputs.logits = outputs.logits[:, num_mem_tokens:(num_mem_tokens + original_seq_len)]
+        else:
+            # For tuple outputs, the logits are the first element
+            num_mem_tokens = self.memory_config.num_longterm_mem_tokens
+            modified_outputs = list(outputs)
+            modified_outputs[0] = modified_outputs[0][:, num_mem_tokens:(num_mem_tokens + original_seq_len)]
+            outputs = tuple(modified_outputs)
+        
         return outputs
     
-    def generate(self, *args, **kwargs):
-        """Wrapper for the generate method of the base model."""
-        # Reset memory states before generation
-        self.reset_memory_state()
+    def generate(self, *args, reset_memory_state=True, **kwargs):
+        """
+        Wrapper for the generate method of the base model.
+        
+        Args:
+            reset_memory_state (bool): Whether to reset memory state before generation.
+        """
+        if reset_memory_state:
+            self.reset_memory_state()
         return self.qwen_model.generate(*args, **kwargs)
 
 

@@ -114,28 +114,58 @@ def pad_and_segment_with_inverse(
     fold_into_batch = True,
     inverse_remove_pad = True
 ):
+    """
+    Pads a sequence tensor to a multiple of segment_len and optionally reshapes it
+    to split the sequence dimension into segments. Also returns an "inverse" function
+    that can transform processed outputs back to the original sequence format.
+    
+    Args:
+        seq (Tensor): Input tensor with shape [batch, seq_len, dim]
+        segment_len (int): Length of each segment
+        fold_into_batch (bool): If True, segments are folded into batch dimension
+        inverse_remove_pad (bool): If True, the inverse function removes padding
+    
+    Returns:
+        tuple: (
+            transformed_seq (Tensor): Padded and possibly reshaped sequence,
+            inverse (callable): Function to convert processed outputs back to original format
+        )
+    """
+    # Extract batch size and sequence length from input tensor
     batch, seq_len = seq.shape[:2]
+    
+    # Calculate the next multiple of segment_len that is >= seq_len
     next_seq_len_mult = round_up_multiple(seq_len, segment_len)
-
+    
+    # Calculate how much padding we need to add to reach the multiple
     padding = next_seq_len_mult - seq_len
     needs_pad = padding > 0
-
+    
+    # Apply padding to the sequence dimension if needed
+    # The pad pattern (0,0,0,padding) means:
+    # - No padding for the last dimension (features)
+    # - No padding at the beginning of sequence dimension, 'padding' at the end
     if needs_pad:
         seq = F.pad(seq, (0, 0, 0, padding))
-
+    
+    # If fold_into_batch is True, reshape tensor from:
+    # [batch, seq_len, dim] to [batch*num_segments, segment_len, dim]
     if fold_into_batch:
         seq = rearrange(seq, 'b (w n) d -> (b w) n d', n = segment_len)
-
+    
+    # Define the inverse function to restore original shape after processing
     def inverse(out):
-
+        # If we folded segments into batch dimension, unfold them back
         if fold_into_batch:
             out = rearrange(out, '(b w) ... n d -> b ... (w n) d', b = batch)
-
+        
+        # If we added padding and inverse_remove_pad is True, remove the padding
         if needs_pad and inverse_remove_pad:
             out = out[..., :-padding, :]
-
+        
         return out
-
+    
+    # Return the transformed sequence and the inverse function
     return seq, inverse
 
 # sampling related
