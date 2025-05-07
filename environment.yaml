@@ -1,0 +1,41 @@
+name: titans
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - pytz
+  - pyyaml
+  - regex
+  - requests
+  - sympy
+  - tqdm
+  - tornado
+  - setuptools
+  - pip:
+    - accelerated-scan>=0.2.0
+    - axial_positional_embedding>=0.3.10
+    - einops>=0.8.0
+    - einx>=0.3.0
+    - hyper-connections>=0.1.11
+    - ninja
+    - rotary-embedding-torch==0.8.6
+    - tensordict
+    - x-transformers==2.3.1
+    - safetensors==0.5.3
+    - tensorboardx
+    - torch==2.3.0
+    - torchaudio==2.3.0
+    - torchvision==0.18.0
+    - torchmetrics
+    - transformers==4.51.3
+    - wandb==0.19.11
+    - tokenizers==0.21.1
+    - adam-atan2-pytorch>=0.1.18
+    - pytest

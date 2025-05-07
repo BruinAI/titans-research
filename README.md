@@ -10,12 +10,6 @@ Unofficial implementation of [Titans](https://arxiv.org/abs/2501.00663) in Pytor
 
 - [Eryk](https://github.com/sentialx) for sharing his early experimental results with me, positive for 2 layer MLP
 
-## Install
-
-```bash
-$ pip install titans-pytorch
-```
-
 ## Usage
 
 ```python
