@@ -30,9 +30,9 @@ dependencies:
     - x-transformers==2.3.1
     - safetensors==0.5.3
     - tensorboardx
-    - torch==2.3.0
-    - torchaudio==2.3.0
-    - torchvision==0.18.0
+    - torch==2.7.0
+    - torchaudio==2.7.0
+    - torchvision==0.22.0
     - torchmetrics
     - transformers==4.51.3
     - wandb==0.19.11

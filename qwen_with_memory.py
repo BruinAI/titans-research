@@ -10,7 +10,7 @@ from transformers.cache_utils import Cache
 
 from titans_pytorch.neural_memory import NeuralMemory
 from titans_pytorch.memory_models import MemoryMLP, MemoryAttention
-from titans_pytorch.mac_transformer import ContinuousAxialPositionalEmbedding, pad_and_segment_with_inverse
+from axial_positional_embedding import ContinuousAxialPositionalEmbedding
 from einops import rearrange, repeat, pack, unpack
 
 
